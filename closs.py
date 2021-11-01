@@ -1,28 +1,26 @@
 #import math
-import termcolor
-import itertools
+#import termcolor
+#import itertools
 from termcolor import colored
 import torch
 import transformers
 from tqdm import tqdm
 import pandas as pd
-import gc
-import os
+#import gc
+#import os
 import numpy as np
 #import scipy
 import copy
-import sys
+#import sys
 import time
 import random
 import torch.nn.functional as F
 from nltk.translate.bleu_score import sentence_bleu
-from termcolor import colored
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+#from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from helpers import *
-import argparse
 
 
-def generate_flip_l_g_a(sentiment_model, LM_model, tokenizer, tokens, text, layer, hs_lr, group_tokens, root_reg,  l, extra_lasso, max_opt_steps, n_samples, topk, substitutions_after_loc, substitutions_after_SVs, min_substitutions_after_SVs, use_hard_scoring, min_substitutions, use_random_n_SV_substitutions, min_run_sample_size, use_grad_for_loc, max_SV_loc_evals, slowly_focus_SV_samples, min_SV_samples_per_sub, SV_samples_per_eval_after_location, logit_matix_source, use_SVs, use_exact, n_branches, tree_depth, beam_width, prob_left_early_stopping, substitution_gen_method, substitution_evaluation_method, saliency_method, gpu_device_num):
+def generate_flip(sentiment_model, LM_model, tokenizer, tokens, text, layer, hs_lr, group_tokens, root_reg,  l, extra_lasso, max_opt_steps, n_samples, topk, substitutions_after_loc, substitutions_after_SVs, min_substitutions_after_SVs, use_hard_scoring, min_substitutions, use_random_n_SV_substitutions, min_run_sample_size, use_grad_for_loc, max_SV_loc_evals, slowly_focus_SV_samples, min_SV_samples_per_sub, SV_samples_per_eval_after_location, logit_matix_source, use_SVs, use_exact, n_branches, tree_depth, beam_width, prob_left_early_stopping, substitution_gen_method, substitution_evaluation_method, saliency_method, gpu_device_num):
 
     start_time = time.time() ###
     model_evals = 0
@@ -31,15 +29,14 @@ def generate_flip_l_g_a(sentiment_model, LM_model, tokenizer, tokens, text, laye
     ids = torch.tensor(tokenizer.convert_tokens_to_ids(tokens)).cuda(gpu_device_num).view(1,-1)
     n_tokens = len(tokens)
     max_SV_evals = int(min_SV_samples_per_sub * topk / SV_samples_per_eval_after_location)
-    bias = F.one_hot(ids, tokenizer.vocab_size)
+#    bias = F.one_hot(ids, tokenizer.vocab_size)
     
     hidden_state = get_embeddings(LM_model, ids, gpu_device_num).cuda(gpu_device_num)
     original_hidden_state = hidden_state.clone().detach()
     model_evals += 1
     prob_pos = probability_positive(tokenizer, sentiment_model, tokens, gpu_device_num)
-    #print(prob_pos)
     found_flip = False
-    restart = False
+#    restart = False
     if prob_pos > 0.5:
         flip_target = 0
     else:
@@ -59,14 +56,16 @@ def generate_flip_l_g_a(sentiment_model, LM_model, tokenizer, tokens, text, laye
             "substitutions" : [],
             "replacement_scores" : []
             }
-        
+    # Generate the initial set of substitutions for each location (assuming we're running CLOSS and not HotFlip):
     if substitution_gen_method in ['logits', 'no_opt_lmh', 'no_opt_e', 'random']:
         candidate_hidden_state = hidden_state.detach().requires_grad_(True)
         if substitution_gen_method == 'logits':
             opt = torch.optim.Adam([candidate_hidden_state], lr=hs_lr)
-        
+
+        # This loop executes n_samples times, each cycle adding another possible substitution to each token location.
         for sample_n in range(n_samples):
             if substitution_gen_method == 'logits':
+                # We now perform a step of embedding optimization:
                 for i in range(0, max_opt_steps):
                     outputs = onwards(candidate_hidden_state, layer, sentiment_model, gpu_device_num)
                     model_evals += 1
@@ -74,10 +73,10 @@ def generate_flip_l_g_a(sentiment_model, LM_model, tokenizer, tokens, text, laye
                     loss_root = 0
 
                     numerical_stability_tensor = 0.0000001 * (0.5 - torch.rand_like(candidate_hidden_state))
-                    if extra_lasso and 'start' in root_reg:
-                        abs_diff_tensor = torch.sum(torch.abs(candidate_hidden_state - original_hidden_state + numerical_stability_tensor), axis=2)
-                        loss_root += l * torch.sum(torch.sqrt(abs_diff_tensor)) / len(tokens)
-                    elif 'squared' in root_reg:
+#                    if extra_lasso and 'start' in root_reg:
+#                        abs_diff_tensor = torch.sum(torch.abs(candidate_hidden_state - original_hidden_state + numerical_stability_tensor), axis=2)
+#                        loss_root += l * torch.sum(torch.sqrt(abs_diff_tensor)) / len(tokens)
+                    if 'squared' in root_reg:
                         squared_diff_tensor = \
                         torch.sum(torch.pow(candidate_hidden_state - original_hidden_state + numerical_stability_tensor, 2), axis=2)
                         if group_tokens:
@@ -92,43 +91,40 @@ def generate_flip_l_g_a(sentiment_model, LM_model, tokenizer, tokens, text, laye
                                 else:
                                     word_loss += squared_diff_tensor[j]
                         loss_root += l[0] * torch.sum(torch.sqrt(squared_diff_tensor)) / len(tokens)
-                    elif 'start' in root_reg:
-                        abs_diff_tensor = torch.abs(candidate_hidden_state - original_hidden_state + numerical_stability_tensor)
-                        loss_root += l[0] * torch.sum(torch.sqrt(abs_diff_tensor)) / len(tokens)
-                    if 'end' in root_reg:
-                        new_token_logits = onwards_token_predict(candidate_hidden_state, layer, LM_model, forward_prediction_target, gpu_device_num)[0]
-                        model_evals += 1
-                        numerical_stability_tensor = 0.000001 * (0.5 - torch.rand_like(new_token_logits))
-                        new_token_probs = torch.functional.F.softmax(new_token_logits, dim=1)
-                        id_token_probs = new_token_probs.gather(1, ids)
-
-
-                        loss_root += l[1] * torch.sum(torch.abs(0.05 + 1 - id_token_probs))
-                        #loss_root += l * torch.sum(torch.sqrt(torch.abs(new_token_logits - initial_token_logits + numerical_stability_tensor)))
-                    if 'cubic' in root_reg:
-                        abs_diff_tensor = torch.abs(candidate_hidden_state - original_hidden_state + numerical_stability_tensor)
-                        loss_root += l[0] * torch.sum(torch.pow(abs_diff_tensor, 1/3))
+#                    elif 'start' in root_reg:
+#                        abs_diff_tensor = torch.abs(candidate_hidden_state - original_hidden_state + numerical_stability_tensor)
+#                        loss_root += l[0] * torch.sum(torch.sqrt(abs_diff_tensor)) / len(tokens)
+#                    if 'end' in root_reg:
+#                        new_token_logits = onwards_token_predict(candidate_hidden_state, layer, LM_model, forward_prediction_target, gpu_device_num)[0]
+#                        model_evals += 1
+#                        numerical_stability_tensor = 0.000001 * (0.5 - torch.rand_like(new_token_logits))
+#                        new_token_probs = torch.functional.F.softmax(new_token_logits, dim=1)
+#                        id_token_probs = new_token_probs.gather(1, ids)
+#
+#
+#                        loss_root += l[1] * torch.sum(torch.abs(0.05 + 1 - id_token_probs))
+#                        #loss_root += l * torch.sum(torch.sqrt(torch.abs(new_token_logits - initial_token_logits + numerical_stability_tensor)))
+#                    if 'cubic' in root_reg:
+#                        abs_diff_tensor = torch.abs(candidate_hidden_state - original_hidden_state + numerical_stability_tensor)
+#                        loss_root += l[0] * torch.sum(torch.pow(abs_diff_tensor, 1/3))
                    
                     if loss_root.item() > 0 and not torch.isnan(loss_root):
                         loss += loss_root
-                    if torch.isnan(loss) or torch.isnan(loss_root):
-                        print(loss_root, loss)
-                        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Error: NaN loss!\n\n\nRestarting:")
-                        return generate_flip(sentiment_model, LM_model, tokenizer, -1, target, layer, root_reg, l, extra_lasso, gpu_device_num)
                     loss.backward()
                     opt.step()
                     opt.zero_grad()
+                    # Reset the hidden states of the beginning and end tokens
                     with torch.no_grad():
                         candidate_hidden_state[:, 0, :] = original_hidden_state[:, 0, :]
                         candidate_hidden_state[:, -1, :] = original_hidden_state[:, -1, :]
-            if logit_matix_source == 'embeddings' or logit_matix_source == 'embedding':
-                nn_embedding = (candidate_hidden_state - position_embedding)[0].detach().requires_grad_(False)
-                token_distances = torch.zeros((len(ids), tokenizer.vocab_size))
-                for token_loc in range(len(ids)):
-                    nn_magnitudes = l1_nearest_neighbor(nn_embedding[token_loc], all_word_embeddings)
-                    token_distances[token_loc, :] = nn_magnitudes
-                sample_logits = -token_distances.cuda(gpu_device_num)
-            elif substitution_gen_method == 'random':
+#            if logit_matix_source == 'embeddings' or logit_matix_source == 'embedding':
+#                nn_embedding = (candidate_hidden_state - position_embedding)[0].detach().requires_grad_(False)
+#                token_distances = torch.zeros((len(ids), tokenizer.vocab_size))
+#                for token_loc in range(len(ids)):
+#                    nn_magnitudes = l1_nearest_neighbor(nn_embedding[token_loc], all_word_embeddings)
+#                    token_distances[token_loc, :] = nn_magnitudes
+#                sample_logits = -token_distances.cuda(gpu_device_num)
+            if substitution_gen_method == 'random':
                 sample_logits = torch.rand((n_tokens, tokenizer.vocab_size))
             else:
                 sample_logits = onwards_token_predict(candidate_hidden_state, layer, LM_model, forward_prediction_target, gpu_device_num)[0]
@@ -138,7 +134,8 @@ def generate_flip_l_g_a(sentiment_model, LM_model, tokenizer, tokens, text, laye
                 _, topk_alternatives = torch.topk(sample_logits, k=1+topk, sorted=True)
                 topk_alternatives = topk_alternatives.tolist()
                 topk_substitutions = [tokenizer.convert_ids_to_tokens(topk_alternatives[i]) for i in range(len(topk_alternatives))]
-            
+            # Go through each token location and add a potential substitution that's (1) different from the original token and (2) different from any 
+            # previously generated tokens for that location:
             for i in range(1, n_tokens - 1):
                 for j in range(1+topk):
                     replacement_from_topk = topk_substitutions[i][j]
@@ -160,6 +157,7 @@ def generate_flip_l_g_a(sentiment_model, LM_model, tokenizer, tokens, text, laye
     substitution_start_time = time.time()
     extra_evals = 0
     
+    # Run HotFlip:
     if substitution_evaluation_method in ['hotflip_only']:
         best_candidate_tokens, extra_evals = hotflip_beamsearch(all_word_embeddings, sentiment_model, tokenizer, loss_fct, beam_width, tree_depth, prob_left_early_stopping, topk, flip_target, prob_pos, tokens, n_tokens, gpu_device_num)
         model_evals += extra_evals
@@ -171,17 +169,20 @@ def generate_flip_l_g_a(sentiment_model, LM_model, tokenizer, tokens, text, laye
         substitution_end_time = time.time()
     print("Extra Evals:", extra_evals)
     
+    
     if substitution_evaluation_method in ['SVs', 'grad-only', 'grad_only']:
-                                
-        
+
+        # Find the most impactful locations in the original text to perform substitutions via gradients.
         logit_grads, extra_evals = get_saliency(sentiment_model, tokenizer, prob_pos, flip_target, tokens, ids, saliency_method, loss_fct, gpu_device_num)
         model_evals += extra_evals
 
         with torch.no_grad():
+            # Select the substitutions for the locations identified by the gradient step as being most important:
             if use_grad_for_loc:
                 print_token_importances(sentiment_model, logit_grads[0], tokens, n_tokens, "grad loc importances:", gpu_device_num)
                 for i in range(1, n_tokens - 1):
                     replacement_options = substitutions_dict[i]['replacement_scores']
+                    # Also filter out any substitutions for the CLS and SEP tokens:
                     if tokens[i] in ['[SEP]', '[CLS]', '</s>', '<s>']:
                         substitutions_dict[i]['loc_score'] = -10
                         substitutions_locs_values[i][1] = -10
@@ -192,7 +193,7 @@ def generate_flip_l_g_a(sentiment_model, LM_model, tokenizer, tokens, text, laye
                 
             n_evals_all_substitutions = 0
             all_substitutions_total_value = 0
-            total_SV = []
+            all_SVs = []
                 
 
             n_substitutions_after_location_SVs = max(int(substitutions_after_loc * n_tokens), 2)
@@ -256,14 +257,14 @@ def generate_flip_l_g_a(sentiment_model, LM_model, tokenizer, tokens, text, laye
                             avg_value_without_sub = (all_substitutions_total_value - substitution_total_value) / n_evals_without_substitution
                             
                             replacement_options[j][7] = avg_value_with_sub - avg_value_without_sub
-                            total_SV.append(replacement_options[j][7])
+                            all_SVs.append(replacement_options[j][7])
             
             substitutions = []
             
-            cutoff = min(len(total_SV), int(n_tokens * substitutions_after_SVs))
-            total_SV = sorted(total_SV, reverse=True)[:cutoff]
+            cutoff = min(len(all_SVs), int(n_tokens * substitutions_after_SVs))
+            all_SVs = sorted(all_SVs, reverse=True)[:cutoff]
             
-            print("\ntotal SVs   =", sum(total_SV))
+            print("\ntotal SVs   =", sum(all_SVs))
 
             for i in range(1, n_tokens - 1):
                 if substitutions_dict[i]['loc_score'] <= location_score_cutoff:
@@ -283,12 +284,12 @@ def generate_flip_l_g_a(sentiment_model, LM_model, tokenizer, tokens, text, laye
                 print(r)
             substitution_end_time = time.time()
             
-            greedy_start_time = time.time()
+            beam_start_time = time.time()
             
             best_candidate_tokens = []
             best_candidate_score = 0
             
-            
+            # Begin beam search to assemble the final counterfactual. 
             if tree_depth > 0:
                 substitutions_already_tested = []
                 counterfactuals_generated = []
@@ -368,11 +369,11 @@ def generate_flip_l_g_a(sentiment_model, LM_model, tokenizer, tokens, text, laye
                         best_candidate_score = candidate_score
                         best_node = generated_counterfactual
                 
-            greedy_end_time = time.time()
+            beam_end_time = time.time()
     
-                    
+    # Print diagnostic information and return the results of counterfactual generation:
     if not substitution_evaluation_method in ['SVs']:
-        greedy_start_time = greedy_end_time = 0
+        beam_start_time = beam_end_time = 0
     input_tokens_prob_pos = probability_positive(tokenizer, sentiment_model, best_candidate_tokens, gpu_device_num)
     print("Final eval prob pos:", input_tokens_prob_pos)
     model_evals += 1
@@ -418,10 +419,10 @@ def generate_flip_l_g_a(sentiment_model, LM_model, tokenizer, tokens, text, laye
 
     if prob_left < 0.5:
         found_flip = True
-    return sameness_list, found_flip, frac_tokens_same, -1, -1, tokenizer.convert_tokens_to_string(best_candidate_tokens), tokens, best_candidate_tokens, [0, 0, opt_end_time - opt_start_time, substitution_end_time - substitution_start_time, greedy_end_time - greedy_start_time], model_evals
+    return sameness_list, found_flip, frac_tokens_same, -1, -1, tokenizer.convert_tokens_to_string(best_candidate_tokens), tokens, best_candidate_tokens, [0, 0, opt_end_time - opt_start_time, substitution_end_time - substitution_start_time, beam_end_time - beam_start_time], model_evals
 
 
-def evaluate_list(text_list, sentiment_model, LM_model, n_epochs, attempts, tokenizer, hs_lr, group_tokens, root_reg, l, extra_lasso, max_opt_steps, n_samples, topk, substitutions_after_loc, substitutions_after_SVs, min_substitutions_after_SVs, use_hard_scoring, min_substitutions, use_random_n_SV_substitutions, min_run_sample_size, use_grad_for_loc, max_SV_loc_evals, slowly_focus_SV_samples, min_SV_samples_per_sub, SV_samples_per_eval_after_location, logit_matix_source, use_SVs, use_exact, n_branches, tree_depth, beam_width, prob_left_early_stopping, substitution_gen_method, substitution_evaluation_method, saliency_method, empty_cache_every_text, logname, data_len_str):
+def evaluate_list(text_list, sentiment_model, LM_model, n_epochs, attempts, tokenizer, hs_lr, group_tokens, root_reg, l, extra_lasso, max_opt_steps, n_samples, topk, substitutions_after_loc, substitutions_after_SVs, min_substitutions_after_SVs, use_hard_scoring, min_substitutions, use_random_n_SV_substitutions, min_run_sample_size, use_grad_for_loc, max_SV_loc_evals, slowly_focus_SV_samples, min_SV_samples_per_sub, SV_samples_per_eval_after_location, logit_matix_source, use_SVs, use_exact, n_branches, tree_depth, beam_width, prob_left_early_stopping, substitution_gen_method, substitution_evaluation_method, saliency_method, empty_cache_every_text, logname, data_len_str, gpu_device_num=0):
 
     result_log = []
     all_results = []
@@ -461,7 +462,7 @@ def evaluate_list(text_list, sentiment_model, LM_model, n_epochs, attempts, toke
         tmp_opt_time = tmp_substitution_time = tmp_greedy_time = tmp_setup_time = tmp_gradient_time = 0
         for i in range(attempts):
             
-            change_indexes, found_flip, frac_tokens_same, frac_words_same, embedding, new_text, old_tokens, new_tokens, all_times, model_evals = generate_flip_l_g_a(sentiment_model, LM_model, tokenizer, tokens, text, 0, hs_lr, group_tokens, root_reg, l, extra_lasso, max_opt_steps, n_samples, topk, substitutions_after_loc, substitutions_after_SVs, min_substitutions_after_SVs, use_hard_scoring, min_substitutions, use_random_n_SV_substitutions, min_run_sample_size, use_grad_for_loc, max_SV_loc_evals, slowly_focus_SV_samples, min_SV_samples_per_sub, SV_samples_per_eval_after_location, logit_matix_source, use_SVs, use_exact, n_branches, tree_depth, beam_width, prob_left_early_stopping, substitution_gen_method, substitution_evaluation_method, saliency_method, gpu_device_num)
+            change_indexes, found_flip, frac_tokens_same, frac_words_same, embedding, new_text, old_tokens, new_tokens, all_times, model_evals = generate_flip(sentiment_model, LM_model, tokenizer, tokens, text, 0, hs_lr, group_tokens, root_reg, l, extra_lasso, max_opt_steps, n_samples, topk, substitutions_after_loc, substitutions_after_SVs, min_substitutions_after_SVs, use_hard_scoring, min_substitutions, use_random_n_SV_substitutions, min_run_sample_size, use_grad_for_loc, max_SV_loc_evals, slowly_focus_SV_samples, min_SV_samples_per_sub, SV_samples_per_eval_after_location, logit_matix_source, use_SVs, use_exact, n_branches, tree_depth, beam_width, prob_left_early_stopping, substitution_gen_method, substitution_evaluation_method, saliency_method, gpu_device_num)
             
         
             if empty_cache_every_text:
@@ -646,204 +647,3 @@ def evaluate_list(text_list, sentiment_model, LM_model, n_epochs, attempts, toke
     f.close()
     
     return
-
-
-parser = argparse.ArgumentParser(description='Generates text counterfactuals using the CLOSS method.')
-
-
-parser.add_argument("--dataset", help="Target dataset; options are \'qnli\', \'imdb\', \'imdb_long\'.")
-parser.add_argument("--beamwidth", help="Beam width for beam search.", type=int)
-parser.add_argument("--w", help="Target number of evaluations per substitution.", type=int)
-parser.add_argument("--K", help="Maximum number of substitutions sampled per salient location.", type=int)
-parser.add_argument("--evaluation", help="The evaluation to perform; options are \'closs\', \'closs-sv\', \'closs-eo\', \'closs-sv+r\'. Note that CLOSS BB is run by using \'closs-eo\' for evaluation, \'default\' for lm_head and \'mask\' as the saliency method.")
-parser.add_argument("--model", help="Model to use; options are \'bert\', \'roberta\'.")
-parser.add_argument("--retrain_epochs", help="Number of retraining epoch for the LM head; default is 10.", type=int)
-parser.add_argument("--lm_head", help="Language modeling head to use; options are \'default\', \'retrained\'.")
-parser.add_argument("--saliency_method", help="Saliency method to use; options are \'mask\', \'norm_grad\'.")
-parser.add_argument("--log_note", help="Extra information you want included in the log file's name.")
-#parser.add_argument("--gpu_device", help="GPU device number.", type=int)
-
-args = parser.parse_args()
-
-
-
-
-# Note: there's an outstanding bug where a small amount of memory is always assigned to gpu device 0.
-# This causes issues if you choose a non-zero gpu device because it forces the method to transfer
-# data between gpu devices, which is slow.
-# As such, running on a non-zero device requires we invoke the method like so:
-# CUDA_VISIBLE_DEVICES=n python3 closs.py [arguments]
-gpu_device_num = 0#args.gpu_device
-use_imdb = False
-use_imdb_long = False
-use_qnli = False
-
-if args.dataset == 'imdb':
-    use_imdb = True
-elif args.dataset == 'qnli':
-    use_qnli = True
-elif args.dataset in ['imdb_long', 'long_imdb']:
-    use_imdb_long = True
-else:
-    print("Error: unknown dataset:", args.dataset)
-
-runid = args.log_note
-
-use_hotflip_only = (str.lower(args.evaluation) in ['hotflip_only', 'hotflip'])
-use_grad_only = (str.lower(args.evaluation) in ['closs-sv', 'grad-only', 'grad_only'])
-no_opt_lmh = (str.lower(args.evaluation) in ['closs-eo', 'no_opt', 'no-opt'])
-random_logit_matrix = (str.lower(args.evaluation) in ['closs-sv+r', 'random'])
-use_SVs = (str.lower(args.evaluation) in ['closs', 'sv', 'svs'])
-test_acc = (str.lower(args.evaluation) in ['test'])
-lms = 'prediction'
-
-if no_opt_lmh or args.lm_head == 'default':
-    lmh_data_source = 'default'
-elif use_imdb_long or use_imdb:
-    lmh_data_source = 'texts:imdb_seperate_' + str(args.retrain_epochs)
-else:
-    lmh_data_source = 'texts:qnli_seperate_' + str(args.retrain_epochs)
-
-
-use_bert = str.lower(args.model) == 'bert'
-use_roberta = str.lower(args.model) == 'roberta'
-
-model_used_str =str.lower(args.model)
-
-print("use_hotflip_only   :", use_hotflip_only)
-print("use_SVs            :", use_SVs)
-print("use_grad_only      :", use_grad_only)
-print("no_opt_lmh         :", no_opt_lmh)
-print("random_logit_matrix:", random_logit_matrix)
-print("use_bert           :", use_bert)
-print("use_roberta        :", use_roberta)
-print("test_acc           :", test_acc)
-
-if use_hotflip_only:
-    substitution_evaluation_method = 'hotflip_only'
-    substitution_gen_method = 'hotflip_only'
-    method_str = 'hotflip_only'
-elif use_SVs:
-    substitution_evaluation_method = 'SVs'
-    substitution_gen_method = 'logits'
-    method_str = 'grounded_rand_SVs'
-elif use_grad_only:
-    substitution_evaluation_method = 'grad_only'
-    method_str = 'grad_sort_only'
-    substitution_gen_method = 'logits'
-elif no_opt_lmh:
-    substitution_evaluation_method = 'SVs'
-    method_str = 'no_opt_grounded_rand_SVs'
-    substitution_gen_method = 'no_opt_lmh'
-elif random_logit_matrix:
-    substitution_evaluation_method = 'SVs'
-    method_str = 'random_grounded_rand_SVs'
-    substitution_gen_method = 'random'
-elif not test_acc:
-    print("Error: no method chosen")
-
-if use_roberta:
-    if use_imdb or use_imdb_long:
-        tokenizer = AutoTokenizer.from_pretrained("textattack/roberta-base-imdb")
-        sentiment_model = AutoModelForSequenceClassification.from_pretrained("textattack/roberta-base-imdb")
-        #sentiment_model.lm_head = torch.load('textattack_roberta_imdb/lm_heads/default_lm_head.pth')
-    elif use_qnli:
-        tokenizer = AutoTokenizer.from_pretrained("textattack/roberta-base-QNLI")
-        sentiment_model = AutoModelForSequenceClassification.from_pretrained("textattack/roberta-base-QNLI")
-        #sentiment_model.lm_head = torch.load('textattack_roberta_QNLI/lm_heads/default_lm_head.pth')
-    
-    if no_opt_lmh:
-        LM_model = transformers.RobertaForMaskedLM.from_pretrained("roberta-base")
-    else:
-        LM_model = sentiment_model
-
-elif use_bert:
-    if use_imdb or use_imdb_long:
-        tokenizer = AutoTokenizer.from_pretrained("textattack/bert-base-uncased-imdb")
-        sentiment_model = AutoModelForSequenceClassification.from_pretrained("textattack/bert-base-uncased-imdb")
-    elif use_qnli:
-        tokenizer = AutoTokenizer.from_pretrained("textattack/bert-base-uncased-QNLI")
-        sentiment_model = AutoModelForSequenceClassification.from_pretrained("textattack/bert-base-uncased-QNLI")
-   
-    if no_opt_lmh:
-        LM_model = transformers.BertForMaskedLM.from_pretrained("bert-base-uncased")
-        LM_model.lm_head = LM_model.cls
-    else:
-        LM_model = sentiment_model
-
-
-retrain_data = []
-if use_imdb or use_imdb_long:
-    if use_imdb:
-        same_texts_as_baselines = pd.read_csv("roberta-base-imdb-short-1000-log.csv")
-    else:
-        same_texts_as_baselines = pd.read_csv("bert-base-uncased-long-imdb-1000-log.csv")
-    
-    if lmh_data_source[:6] == 'texts:':
-        retrain_data = process_dataframe(pd.read_csv("retrain_1000_data_different_from_roberta-base-imdb-short-1000-log.csv"), sentiment_model, tokenizer, test_acc)
-    same_texts_as_baselines_list = process_dataframe(same_texts_as_baselines, sentiment_model, tokenizer, test_acc)
-
-
-elif use_qnli:
-    same_texts_as_baselines = pd.read_csv("roberta-base-qnli-new-1000-textfooler-log.csv")
-
-    if lmh_data_source[:6] == 'texts:':
-        retrain_data = process_dataframe(pd.read_csv("retrain_1000_data_different_from_roberta-base-qnli-new-1000-textfooler-log.csv"), sentiment_model, tokenizer, test_acc)
-    same_texts_as_baselines_list = process_dataframe(same_texts_as_baselines, sentiment_model, tokenizer, test_acc)
-
-
-sentiment_model.cuda(gpu_device_num)
-sentiment_model.eval()
-
-LM_model.cuda(gpu_device_num)
-LM_model.eval()
-
-for p in LM_model.parameters():
-    p.requires_grad = False
-    
-for p in sentiment_model.parameters():
-    p.requires_grad = False
-
-
-lm_head = get_lm_head(LM_model, lmh_data_source, args.retrain_epochs, tokenizer, retrain_data, gpu_device_num)
-lm_head.cuda(gpu_device_num)
-lm_head.eval()
-for p in lm_head.parameters():
-    p.requires_grad = False
-
-LM_model.lm_head = lm_head
-sentiment_model.lm_head = lm_head
-
-
-
-
-
-if use_hotflip_only:
-    all_word_embeddings = torch.zeros((tokenizer.vocab_size, 768)).detach().cuda(gpu_device_num)
-
-    for i in range(tokenizer.vocab_size):
-        input_tensor = torch.tensor(i).view(1, 1).cuda(gpu_device_num)
-        word_embedding = get_word_embeddings(sentiment_model, input_tensor)
-        all_word_embeddings[i, :] = word_embedding
-    all_word_embeddings = all_word_embeddings.detach().requires_grad_(False)
-    print("Computed embeddings")
-else:
-    all_word_embeddings = None
-
-
-print("use_imdb:", use_imdb)
-print("use_imdb_long:", use_imdb_long)
-print("use_qnli:", use_qnli)
-
-
-arglist = args.dataset + '_' + str(args.beamwidth) + '_' + str(args.w) + '_' + str(args.K) + '_' + args.evaluation + '_' + str(args.retrain_epochs) + '_' + args.lm_head + '_' + args.saliency_method + '_' + args.log_note
-
-print("substitution_gen_method=", substitution_gen_method, "; substitution_evaluation_method=", substitution_evaluation_method)
-print("saliency_method=", args.saliency_method)
-print("GPU device num:", gpu_device_num)
-
-
-if not test_acc:
-    evaluate_list(same_texts_as_baselines_list, sentiment_model, LM_model, args.retrain_epochs, 1, tokenizer, hs_lr=0.005, group_tokens=False, root_reg=['squared'], l=[1], extra_lasso=False, max_opt_steps=1, n_samples=args.K, topk=args.K,  substitutions_after_loc=0.15, substitutions_after_SVs=10, min_substitutions_after_SVs=50, use_hard_scoring=True, min_substitutions=15, use_random_n_SV_substitutions=False, min_run_sample_size=4, use_grad_for_loc=True, max_SV_loc_evals=0, slowly_focus_SV_samples=True, min_SV_samples_per_sub=args.w, SV_samples_per_eval_after_location=0.5, logit_matix_source=lms, use_SVs=True, use_exact=False, n_branches=args.beamwidth, tree_depth=0.15, beam_width=args.beamwidth, prob_left_early_stopping=0.499999, substitution_gen_method=substitution_gen_method, substitution_evaluation_method=substitution_evaluation_method, saliency_method=args.saliency_method, empty_cache_every_text=True, logname='closs_log_' + arglist + '__' + runid, data_len_str=args.dataset)
-
-print('beamwidth:', args.beamwidth, 'w:', args.w, 'K:', args.K, 'lognotes:', runid)
